@@ -22,23 +22,11 @@ from .exceptions import (
     TemporarilyBlocked,
 )
 from .types import WebImage, GeneratedImage, Candidate, ModelOutput
-from .utils import (
-    upload_file,
-    parse_file_name,
-    rotate_tasks,
-    logger,
-)
+from .utils import logger
 
+rotate_tasks: dict[str, Task] = {}
 
 def running(retry: int = 0) -> callable:
-    """
-    Decorator to check if client is running before making a request.
-
-    Parameters
-    ----------
-    retry: `int`, optional
-        Max number of retries when `gemini_webapi.APIError` is raised.
-    """
 
     def decorator(func):
         @functools.wraps(func)
@@ -125,26 +113,7 @@ class GeminiClient:
         refresh_interval: float = 540,
         verbose: bool = True,
     ) -> None:
-        """
-        Get SNlM0e value as access token. Without this token posting will fail with 400 bad request.
-
-        Parameters
-        ----------
-        timeout: `float`, optional
-            Request timeout of the client in seconds. Used to limit the max waiting time when sending a request.
-        auto_close: `bool`, optional
-            If `True`, the client will close connections and clear resource usage after a certain period
-            of inactivity. Useful for always-on services.
-        close_delay: `float`, optional
-            Time to wait before auto-closing the client in seconds. Effective only if `auto_close` is `True`.
-        auto_refresh: `bool`, optional
-            If `True`, will schedule a task to automatically refresh cookies in the background.
-        refresh_interval: `float`, optional
-            Time interval for background cookie refresh in seconds. Effective only if `auto_refresh` is `True`.
-        verbose: `bool`, optional
-            If `True`, will print more infomation in logs.
-        """
-
+        
         try:
             if not self.cookie_file.is_file():
                  raise FileNotFoundError("cookies file not found: "+str(self.cookie_file))
@@ -159,7 +128,6 @@ class GeminiClient:
                 timeout=timeout,
                 proxy=self.proxy,
                 follow_redirects=True,
-                headers=Headers.GEMINI.value,
                 cookies=self.cookies,
                 **self.kwargs,
             )
@@ -187,15 +155,6 @@ class GeminiClient:
     
 
     async def close(self, delay: float = 0) -> None:
-        """
-        Close the client after a certain period of inactivity, or call manually to close immediately.
-
-        Parameters
-        ----------
-        delay: `float`, optional
-            Time to wait before closing the client in seconds.
-        """
-
         if delay:
             await asyncio.sleep(delay)
 
@@ -209,9 +168,6 @@ class GeminiClient:
             await self.client.aclose()
 
     async def reset_close_task(self) -> None:
-        """
-        Reset the timer for closing the client when a new request is made.
-        """
 
         if self.close_task:
             self.close_task.cancel()
@@ -220,7 +176,7 @@ class GeminiClient:
     
     async def get_access_token(self) -> tuple[str, dict]:
         try:
-            response = await self.client.get(Endpoint.INIT.value)
+            response = await self.client.get(url=Endpoint.INIT.value,headers=Headers.GEMINI.value)
             response.raise_for_status()
             match = re.search(r'"SNlM0e":"(.*?)"', response.text)
             if match: return match.group(1)
@@ -230,30 +186,19 @@ class GeminiClient:
     
     async def rotate_cookies(self) -> str:
         if not (self.cookie_file.is_file() and time.time() - os.path.getmtime(self.cookie_file) <= 60):
-            async with AsyncClient(http2=True, proxy=self.proxy) as client:
-                response = await client.post(
+                response = await self.client.post(
                     url=Endpoint.ROTATE_COOKIES.value,
                     headers=Headers.ROTATE_COOKIES.value,
-                    cookies=self.cookies,
                     data='[000,"-0000000000000000000"]',
                 )
-                if response.status_code == 401:
-                    raise AuthError
+                if response.status_code == 401: raise AuthError
                 response.raise_for_status()
-                cookie_psid = "__Secure-1PSID"
-                cookie_psid_value=self.cookies.get(cookie_psid)
-                domain=".google.com"
-                self.cookies= response.cookies
+                response = await self.client.get(url=Endpoint.INIT.value)
+                response.raise_for_status()
                 with open(self.cookie_file, 'w') as f:
                     cookies = []
-                    is_psid_present=False
-                    for cookie in response.cookies.jar:
-                        if cookie.domain == domain:
-                            cookies.append({"name":cookie.name ,"value":cookie.value ,"domain":cookie.domain})
-                        if cookie.name == cookie_psid:
-                            is_psid_present= True
-                    if not is_psid_present:
-                       cookies.append({"name": cookie_psid , "value": cookie_psid_value ,"domain": domain})
+                    for cookie in self.client.cookies.jar:
+                        cookies.append({"name":cookie.name ,"value":cookie.value ,"domain":cookie.domain})
                     json.dump(cookies,f)
 
 
@@ -284,43 +229,7 @@ class GeminiClient:
         chat: Optional["ChatSession"] = None,
         **kwargs,
     ) -> ModelOutput:
-        """
-        Generates contents with prompt.
-
-        Parameters
-        ----------
-        prompt: `str`
-            Prompt provided by user.
-        files: `list[str | Path]`, optional
-            List of file paths to be attached.
-        model: `Model` | `str`, optional
-            Specify the model to use for generation.
-            Pass either a `gemini_webapi.constants.Model` enum or a model name string.
-        chat: `ChatSession`, optional
-            Chat data to retrieve conversation history. If None, will automatically generate a new chat id when sending post request.
-        kwargs: `dict`, optional
-            Additional arguments which will be passed to the post request.
-            Refer to `httpx.AsyncClient.request` for more information.
-
-        Returns
-        -------
-        :class:`ModelOutput`
-            Output data from gemini.google.com, use `ModelOutput.text` to get the default text reply, `ModelOutput.images` to get a list
-            of images in the default reply, `ModelOutput.candidates` to get a list of all answer candidates in the output.
-
-        Raises
-        ------
-        `AssertionError`
-            If prompt is empty.
-        `gemini_webapi.TimeoutError`
-            If request timed out.
-        `gemini_webapi.GenimiError`
-            If no reply candidate found in response.
-        `gemini_webapi.APIError`
-            - If request failed with status code other than 200.
-            - If response structure is invalid and failed to parse.
-        """
-
+        
         assert prompt, "Prompt cannot be empty."
 
         if not isinstance(model, Model):
@@ -332,7 +241,7 @@ class GeminiClient:
         try:
             response = await self.client.post(
                 Endpoint.GENERATE.value,
-                headers=model.model_header,
+                headers=Headers.GEMINI.value | model.model_header,
                 data={
                     "at": self.access_token,
                     "f.req": json.dumps(
@@ -347,7 +256,7 @@ class GeminiClient:
                                         None,
                                         [
                                             [
-                                                [await upload_file(file, self.proxy)],
+                                                [await self.upload_file(file)],
                                                 parse_file_name(file),
                                             ]
                                             for file in files
@@ -518,53 +427,32 @@ class GeminiClient:
             return output
 
     def start_chat(self, **kwargs) -> "ChatSession":
-        """
-        Returns a `ChatSession` object attached to this client.
-
-        Parameters
-        ----------
-        kwargs: `dict`, optional
-            Additional arguments which will be passed to the chat session.
-            Refer to `gemini_webapi.ChatSession` for more information.
-
-        Returns
-        -------
-        :class:`ChatSession`
-            Empty chat session object for retrieving conversation history.
-        """
 
         return ChatSession(geminiclient=self, **kwargs)
     
     async def delete_chat(self, cid: str) -> bool:
         res = await self.client.post(
                Endpoint.DELETE.value,
+               headers=Headers.GEMINI.value,
                 data={
                     "at": self.access_token,
                     "f.req": json.dumps([[["GzXR5e",json.dumps([cid]),None,"generic"]]])
                 },
             )
         return res.status_code == 200
-
+    
+    async def upload_file(self,file: str | Path) -> str:
+        with open(file, "rb") as f:
+            file = f.read()
+        response = await self.client.post(
+            url=Endpoint.UPLOAD.value,
+            headers=Headers.UPLOAD.value,
+            files={"file": file},
+            )
+        response.raise_for_status()
+        return response.text
+        
 class ChatSession:
-    """
-    Chat data to retrieve conversation history. Only if all 3 ids are provided will the conversation history be retrieved.
-
-    Parameters
-    ----------
-    geminiclient: `GeminiClient`
-        Async httpx client interface for gemini.google.com.
-    metadata: `list[str]`, optional
-        List of chat metadata `[cid, rid, rcid]`, can be shorter than 3 elements, like `[cid, rid]` or `[cid]` only.
-    cid: `str`, optional
-        Chat id, if provided together with metadata, will override the first value in it.
-    rid: `str`, optional
-        Reply id, if provided together with metadata, will override the second value in it.
-    rcid: `str`, optional
-        Reply candidate id, if provided together with metadata, will override the third value in it.
-    model: `Model` | `str`, optional
-        Specify the model to use for generation.
-        Pass either a `gemini_webapi.constants.Model` enum or a model name string.
-    """
 
     __slots__ = [
         "__metadata",
@@ -614,62 +502,12 @@ class ChatSession:
         files: list[str | Path] | None = None,
         **kwargs,
     ) -> ModelOutput:
-        """
-        Generates contents with prompt.
-        Use as a shortcut for `GeminiClient.generate_content(prompt, image, self)`.
-
-        Parameters
-        ----------
-        prompt: `str`
-            Prompt provided by user.
-        files: `list[str | Path]`, optional
-            List of file paths to be attached.
-        kwargs: `dict`, optional
-            Additional arguments which will be passed to the post request.
-            Refer to `httpx.AsyncClient.request` for more information.
-
-        Returns
-        -------
-        :class:`ModelOutput`
-            Output data from gemini.google.com, use `ModelOutput.text` to get the default text reply, `ModelOutput.images` to get a list
-            of images in the default reply, `ModelOutput.candidates` to get a list of all answer candidates in the output.
-
-        Raises
-        ------
-        `AssertionError`
-            If prompt is empty.
-        `gemini_webapi.TimeoutError`
-            If request timed out.
-        `gemini_webapi.GenimiError`
-            If no reply candidate found in response.
-        `gemini_webapi.APIError`
-            - If request failed with status code other than 200.
-            - If response structure is invalid and failed to parse.
-        """
 
         return await self.geminiclient.generate_content(
             prompt=prompt, files=files, model=self.model, chat=self, **kwargs
         )
 
     def choose_candidate(self, index: int) -> ModelOutput:
-        """
-        Choose a candidate from the last `ModelOutput` to control the ongoing conversation flow.
-
-        Parameters
-        ----------
-        index: `int`
-            Index of the candidate to choose, starting from 0.
-
-        Returns
-        -------
-        :class:`ModelOutput`
-            Output data of the chosen candidate.
-
-        Raises
-        ------
-        `ValueError`
-            If no previous output data found in this chat session, or if index exceeds the number of candidates in last model output.
-        """
 
         if not self.last_output:
             raise ValueError("No previous output data found in this chat session.")
@@ -716,3 +554,10 @@ class ChatSession:
     @rcid.setter
     def rcid(self, value: str):
         self.__metadata[2] = value
+
+def parse_file_name(file: str | Path) -> str:
+    file = Path(file)
+    if not file.is_file():
+        raise ValueError(f"{file} is not a valid file.")
+
+    return file.name
