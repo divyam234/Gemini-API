@@ -1,11 +1,11 @@
 from enum import Enum
 
-
 class Endpoint(Enum):
     INIT = "https://gemini.google.com/app"
     GENERATE = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
     ROTATE_COOKIES = "https://accounts.google.com/RotateCookies"
     UPLOAD = "https://content-push.googleapis.com/upload"
+    DELETE= "https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=GzXR5e&source-path=%2Fapp&bl=boq_assistant-bard-web-server_20250513.02_p3&rt=c"
 
 
 class Headers(Enum):

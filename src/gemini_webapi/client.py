@@ -2,11 +2,13 @@ import asyncio
 import functools
 import json
 import re
+import time
+import os
 from asyncio import Task
 from pathlib import Path
 from typing import Any, Optional
 
-from httpx import AsyncClient, ReadTimeout
+from httpx import AsyncClient, ReadTimeout,Cookies
 
 from .constants import Endpoint, ErrorCode, Headers, Model
 from .exceptions import (
@@ -23,9 +25,6 @@ from .types import WebImage, GeneratedImage, Candidate, ModelOutput
 from .utils import (
     upload_file,
     parse_file_name,
-    rotate_1psidts,
-    get_access_token,
-    load_browser_cookies,
     rotate_tasks,
     logger,
 )
@@ -80,32 +79,10 @@ def running(retry: int = 0) -> callable:
 
 
 class GeminiClient:
-    """
-    Async httpx client interface for gemini.google.com.
-
-    `secure_1psid` must be provided unless the optional dependency `browser-cookie3` is installed and
-    you have logged in to google.com in your local browser.
-
-    Parameters
-    ----------
-    secure_1psid: `str`, optional
-        __Secure-1PSID cookie value.
-    secure_1psidts: `str`, optional
-        __Secure-1PSIDTS cookie value, some google accounts don't require this value, provide only if it's in the cookie list.
-    proxy: `str`, optional
-        Proxy URL.
-    kwargs: `dict`, optional
-        Additional arguments which will be passed to the http client.
-        Refer to `httpx.AsyncClient` for more information.
-
-    Raises
-    ------
-    `ValueError`
-        If `browser-cookie3` is installed but cookies for google.com are not found in your local browser storage.
-    """
 
     __slots__ = [
         "cookies",
+        "cookie_file",
         "proxy",
         "running",
         "client",
@@ -121,12 +98,10 @@ class GeminiClient:
 
     def __init__(
         self,
-        secure_1psid: str | None = None,
-        secure_1psidts: str | None = None,
+        cookie_file: Path = None,
         proxy: str | None = None,
-        **kwargs,
+        **kwargs
     ):
-        self.cookies = {}
         self.proxy = proxy
         self.running: bool = False
         self.client: AsyncClient | None = None
@@ -137,22 +112,9 @@ class GeminiClient:
         self.close_task: Task | None = None
         self.auto_refresh: bool = True
         self.refresh_interval: float = 540
+        self.cookies = Cookies()
+        self.cookie_file = cookie_file
         self.kwargs = kwargs
-
-        # Validate cookies
-        if secure_1psid:
-            self.cookies["__Secure-1PSID"] = secure_1psid
-            if secure_1psidts:
-                self.cookies["__Secure-1PSIDTS"] = secure_1psidts
-        else:
-            try:
-                cookies = load_browser_cookies(domain_name="google.com")
-                if not (cookies and cookies.get("__Secure-1PSID")):
-                    raise ValueError(
-                        "Failed to load cookies from local browser. Please pass cookie values manually."
-                    )
-            except ImportError:
-                pass
 
     async def init(
         self,
@@ -184,9 +146,13 @@ class GeminiClient:
         """
 
         try:
-            access_token, valid_cookies = await get_access_token(
-                base_cookies=self.cookies, proxy=self.proxy, verbose=verbose
-            )
+            if not self.cookie_file.is_file():
+                 raise FileNotFoundError("cookies file not found: "+str(self.cookie_file))
+            
+            with open(self.cookie_file) as f: 
+                data = json.load(f)
+                for cookie in data:
+                    self.cookies.set(cookie["name"],cookie["value"],cookie["domain"])
 
             self.client = AsyncClient(
                 http2=True,
@@ -194,13 +160,12 @@ class GeminiClient:
                 proxy=self.proxy,
                 follow_redirects=True,
                 headers=Headers.GEMINI.value,
-                cookies=valid_cookies,
+                cookies=self.cookies,
                 **self.kwargs,
             )
-            self.access_token = access_token
-            self.cookies = valid_cookies
-            self.running = True
 
+            self.access_token = await self.get_access_token()
+            self.running = True
             self.timeout = timeout
             self.auto_close = auto_close
             self.close_delay = close_delay
@@ -209,18 +174,17 @@ class GeminiClient:
 
             self.auto_refresh = auto_refresh
             self.refresh_interval = refresh_interval
-            if task := rotate_tasks.get(self.cookies["__Secure-1PSID"]):
+            if task := rotate_tasks.get("refresh_cookies"):
                 task.cancel()
             if self.auto_refresh:
-                rotate_tasks[self.cookies["__Secure-1PSID"]] = asyncio.create_task(
-                    self.start_auto_refresh()
-                )
+                rotate_tasks["refresh_cookies"] = asyncio.create_task(self.start_auto_refresh())
 
             if verbose:
                 logger.success("Gemini client initialized successfully.")
         except Exception:
             await self.close()
             raise
+    
 
     async def close(self, delay: float = 0) -> None:
         """
@@ -253,6 +217,45 @@ class GeminiClient:
             self.close_task.cancel()
             self.close_task = None
         self.close_task = asyncio.create_task(self.close(self.close_delay))
+    
+    async def get_access_token(self) -> tuple[str, dict]:
+        try:
+            response = await self.client.get(Endpoint.INIT.value)
+            response.raise_for_status()
+            match = re.search(r'"SNlM0e":"(.*?)"', response.text)
+            if match: return match.group(1)
+            else: raise Exception()
+        except Exception:
+            raise AuthError("Could not get access token check cookies")
+    
+    async def rotate_cookies(self) -> str:
+        if not (self.cookie_file.is_file() and time.time() - os.path.getmtime(self.cookie_file) <= 60):
+            async with AsyncClient(http2=True, proxy=self.proxy) as client:
+                response = await client.post(
+                    url=Endpoint.ROTATE_COOKIES.value,
+                    headers=Headers.ROTATE_COOKIES.value,
+                    cookies=self.cookies,
+                    data='[000,"-0000000000000000000"]',
+                )
+                if response.status_code == 401:
+                    raise AuthError
+                response.raise_for_status()
+                cookie_psid = "__Secure-1PSID"
+                cookie_psid_value=self.cookies.get(cookie_psid)
+                domain=".google.com"
+                self.cookies= response.cookies
+                with open(self.cookie_file, 'w') as f:
+                    cookies = []
+                    is_psid_present=False
+                    for cookie in response.cookies.jar:
+                        if cookie.domain == domain:
+                            cookies.append({"name":cookie.name ,"value":cookie.value ,"domain":cookie.domain})
+                        if cookie.name == cookie_psid:
+                            is_psid_present= True
+                    if not is_psid_present:
+                       cookies.append({"name": cookie_psid , "value": cookie_psid_value ,"domain": domain})
+                    json.dump(cookies,f)
+
 
     async def start_auto_refresh(self) -> None:
         """
@@ -261,17 +264,15 @@ class GeminiClient:
 
         while True:
             try:
-                new_1psidts = await rotate_1psidts(self.cookies, self.proxy)
+               await self.rotate_cookies()
             except AuthError:
-                if task := rotate_tasks.get(self.cookies["__Secure-1PSID"]):
+                if task := rotate_tasks.get("refresh_cookies"):
                     task.cancel()
                 logger.warning(
                     "Failed to refresh cookies. Background auto refresh task canceled."
                 )
 
-            logger.debug(f"Cookies refreshed. New __Secure-1PSIDTS: {new_1psidts}")
-            if new_1psidts:
-                self.cookies["__Secure-1PSIDTS"] = new_1psidts
+            logger.debug(f"Cookies refreshed")
             await asyncio.sleep(self.refresh_interval)
 
     @running(retry=2)
@@ -533,7 +534,16 @@ class GeminiClient:
         """
 
         return ChatSession(geminiclient=self, **kwargs)
-
+    
+    async def delete_chat(self, cid: str) -> bool:
+        res = await self.client.post(
+               Endpoint.DELETE.value,
+                data={
+                    "at": self.access_token,
+                    "f.req": json.dumps([[["GzXR5e",json.dumps([cid]),None,"generic"]]])
+                },
+            )
+        return res.status_code == 200
 
 class ChatSession:
     """
