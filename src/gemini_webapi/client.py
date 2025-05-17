@@ -193,8 +193,7 @@ class GeminiClient:
                 )
                 if response.status_code == 401: raise AuthError
                 response.raise_for_status()
-                response = await self.client.get(url=Endpoint.INIT.value)
-                response.raise_for_status()
+                self.access_token=await self.get_access_token()
                 with open(self.cookie_file, 'w') as f:
                     cookies = []
                     for cookie in self.client.cookies.jar:
